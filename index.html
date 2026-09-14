@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>闪烁码传输 · 用屏幕和摄像头传文件</title>
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1>闪烁码传输</h1>
+    <span class="sub">屏幕闪、摄像头看，隔空把文件搬过去</span>
+    <nav>
+      <a href="index.html" aria-current="page">首页</a>
+      <a href="send.html">发送</a>
+      <a href="recv.html">接收</a>
+      <a href="loopback.html">自检</a>
+    </nav>
+  </header>
+
+  <div class="cards" style="margin-bottom:22px">
+    <div class="card">
+      <h3>① 发送端</h3>
+      <p>在有文件的那台设备上打开，选好文件，屏幕开始循环播放闪烁码。</p>
+      <a class="go" href="send.html"><button class="primary">打开发送端</button></a>
+    </div>
+    <div class="card">
+      <h3>② 接收端</h3>
+      <p>在另一台设备上打开，用摄像头对准那块屏幕，收满了就能下载。</p>
+      <a class="go" href="recv.html"><button class="primary">打开接收端</button></a>
+    </div>
+    <div class="card">
+      <h3>③ 只有一台设备？</h3>
+      <p>回环自检会在本页面里模拟出一个「假摄像头」，把整条链路跑一遍。</p>
+      <a class="go" href="loopback.html"><button>跑一次自检</button></a>
+    </div>
+  </div>
+
+  <div class="cols">
+    <div>
+      <div class="panel">
+        <h2>它是怎么工作的</h2>
+        <p class="note">
+          <b>喷泉码，不是轮播。</b>把文件切成 K 个块之后，发送端不是按 1…K 顺序播放，
+          而是每帧随机挑若干块异或在一起发出去，可以无限生成不重复的帧。
+          接收端只要攒够任意约 1.3K 个有效帧就能反解出全部原始块——
+          <b>丢帧不用重传，中途接入也不用等下一轮</b>。这条信道是纯单向的，没有反向通道可用，
+          所以这是唯一务实的做法。
+        </p>
+        <p class="note">
+          <b>每帧自带纠错。</b>帧内数据经过 Reed-Solomon 分块编码并交织，
+          画面上一小片反光造成的连续错误会被摊到各个纠错块上。
+          帧头另有独立的 RS(32,16) + CRC16 保护，载荷还有 CRC32 兜底：
+          读错的帧会被直接丢掉，对喷泉码而言那只是一次「丢帧」。
+        </p>
+        <p class="note">
+          <b>四角定位 + 颜色自校准。</b>四个角上是 QR 式的 1:1:3:1:1 定位图案，
+          识别时先找到它们、算出单应矩阵（平面在针孔相机下的映射是精确射影变换，一个单应就够），
+          再按格子亚像素采样。四条边上排着已知颜色的校准格，
+          接收端据此现场学出「这台摄像头把红色拍成了什么」，
+          所以偏色、暗角、屏幕亮度不一致都不影响判读。
+        </p>
+      </div>
+
+      <div class="panel">
+        <h2>参数怎么选</h2>
+        <table class="kv">
+          <tr><td>调色板</td><td>先用<b>八色</b>；反光/色偏严重或摄像头一般时换<b>黑白</b>。四灰阶介于两者之间，但最挑画质。</td></tr>
+          <tr><td>版面尺寸</td><td>格子越多越快，但每格至少要占摄像头 <b>4~5 个像素</b>。手机拍 1080p、码图占满取景框时，65 或 81 比较合适。</td></tr>
+          <tr><td>纠错强度</td><td>默认中档。识别率上不去先调高它，再考虑降版面。</td></tr>
+          <tr><td>帧率</td><td>10 fps 起步。调到超过摄像头能稳定拍下的速度，只会白白丢帧。</td></tr>
+        </table>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel">
+        <h2>参考速率</h2>
+        <p class="note" style="margin-top:0">按 10 fps 计算的每秒净数据量（不含喷泉码开销）：</p>
+        <table class="kv" id="rateTable"></table>
+        <p class="note" style="margin-bottom:0">
+          实际速率还要打个折：喷泉码开销通常 1.3~1.4 倍，加上没拍到的帧。
+        </p>
+      </div>
+
+      <div class="panel">
+        <h2>用之前先确认</h2>
+        <p class="note" style="margin-top:0">
+          摄像头只在<b>安全上下文</b>下可用。<code>http://localhost</code> 算安全，
+          局域网 IP 不算——手机要访问电脑时必须走 HTTPS。
+        </p>
+        <p class="note">
+          <code>node server.js</code> 起本地服务；<br>
+          <code>node server.js --https</code> 会自己签一张证书并起 HTTPS（纯 Node 实现，不需要 openssl），
+          手机访问 <code>https://电脑IP:8443</code>，浏览器会警告证书不受信，选「继续访问」即可。
+        </p>
+        <p class="note" style="margin-bottom:0">
+          当前页面：<span id="ctxBadge" class="badge">检测中</span>
+        </p>
+      </div>
+
+      <div class="panel">
+        <h2>不适合做什么</h2>
+        <p class="note" style="margin:0">
+          它是给<b>物理隔离</b>场景用的（隔着一块屏、没网、不能插 U 盘）。
+          速率在几 KB/s 到几十 KB/s 之间，传配置文件、密钥、文本、小图片合适，
+          传视频不合适。传输过程<b>没有加密</b>——任何能看到屏幕的人都能拍下来还原，
+          需要保密请自行先加密再传。
+        </p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import { frameGeometry } from './src/protocol.js';
+import { $ } from './src/ui.js';
+
+const tbl = $('#rateTable');
+const names = { bw: '黑白', gray4: '四灰阶', rgb8: '八色' };
+for (const n of [49, 65, 81, 97]) {
+  for (const p of ['bw', 'gray4', 'rgb8']) {
+    let geo;
+    try { geo = frameGeometry(n, p, 32); } catch { continue; }
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${n}×${n} · ${names[p]}</td><td>${geo.blockSize} B/帧 → <b>${((geo.blockSize * 10) / 1024).toFixed(1)} KB/s</b></td>`;
+    tbl.appendChild(tr);
+  }
+}
+
+const badge = $('#ctxBadge');
+if (window.isSecureContext) {
+  badge.className = 'badge ok';
+  badge.textContent = `安全上下文 ✓ 摄像头可用（${location.origin}）`;
+} else {
+  badge.className = 'badge err';
+  badge.textContent = `非安全上下文 ✗ 接收端用不了摄像头（${location.origin}）`;
+}
+</script>
+</body>
+</html>

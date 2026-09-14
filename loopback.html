@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>自检 · 闪烁码传输</title>
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1>回环自检</h1>
+    <span class="sub">不用摄像头，在本页面里跑完一次完整传输</span>
+    <nav>
+      <a href="index.html">首页</a>
+      <a href="send.html">发送</a>
+      <a href="recv.html">接收</a>
+      <a href="loopback.html" aria-current="page">自检</a>
+    </nav>
+  </header>
+
+  <p class="note" style="margin:-6px 0 18px">
+    这里把发送端画出来的码图，用一个「假摄像头」加上透视、失焦、噪声、暗角、随机丢帧，
+    再原样送进接收端。参数调不对会立刻在这里露馅，不用折腾两台设备。
+  </p>
+
+  <div class="cols">
+    <div>
+      <div class="panel">
+        <h2>传输内容</h2>
+        <div class="drop" id="drop"><strong>拖文件到这里</strong>或点击选择（留空则用随机数据）</div>
+        <input type="file" id="file" hidden>
+        <label class="field" style="margin-top:12px">
+          <span>随机数据大小（KB）</span>
+          <input type="number" id="size" value="32" min="1" max="2048">
+        </label>
+      </div>
+
+      <div class="panel">
+        <h2>编码参数</h2>
+        <label class="field">
+          <span>调色板</span>
+          <select id="palette">
+            <option value="bw">黑白 · 1 bit/格</option>
+            <option value="gray4">四灰阶 · 2 bit/格</option>
+            <option value="rgb8" selected>八色 · 3 bit/格</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>版面尺寸</span>
+          <select id="grid">
+            <option value="41">41 × 41</option>
+            <option value="49">49 × 49</option>
+            <option value="65" selected>65 × 65</option>
+            <option value="81">81 × 81</option>
+            <option value="97">97 × 97</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>纠错强度 nsym</span>
+          <select id="nsym">
+            <option value="16">16 · 低</option>
+            <option value="32" selected>32 · 中</option>
+            <option value="48">48 · 高</option>
+            <option value="64">64 · 很高</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="panel">
+        <h2>信道条件</h2>
+        <label class="field">
+          <span>拍摄质量</span>
+          <select id="quality">
+            <option value="good">好 · 正对、对焦准</option>
+            <option value="normal" selected>一般 · 略斜、轻微模糊</option>
+            <option value="bad">差 · 明显斜、失焦、噪声大</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>丢帧率 <b id="dropVal">25</b>%</span>
+          <input type="range" id="dropRate" min="0" max="80" step="5" value="25">
+        </label>
+        <div class="row">
+          <button id="run" class="primary">开始自检</button>
+          <button id="halt" disabled>中止</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>结果</h2>
+        <div class="bar"><i id="progBar"></i></div>
+        <table class="kv">
+          <tr><td>状态</td><td id="state"><span class="badge">未开始</span></td></tr>
+          <tr><td>每格像素</td><td id="pxCell">—</td></tr>
+          <tr><td>分块</td><td id="kBlocks">—</td></tr>
+          <tr><td>已发 / 已识别</td><td id="counts">—</td></tr>
+          <tr><td>识别成功率</td><td id="hit">—</td></tr>
+          <tr><td>喷泉码开销</td><td id="overhead">—</td></tr>
+          <tr><td>单帧解码耗时</td><td id="ms">—</td></tr>
+          <tr><td>校验</td><td id="verify">—</td></tr>
+        </table>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel">
+        <h2>发送端画面</h2>
+        <div class="stage" style="min-height:0;padding:10px"><canvas id="cvSend"></canvas></div>
+      </div>
+      <div class="panel">
+        <h2>「摄像头」看到的画面</h2>
+        <div class="stage" style="min-height:0;padding:10px"><canvas id="cvCam"></canvas></div>
+      </div>
+      <div class="panel">
+        <h2>日志</h2>
+        <div class="log" id="log"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import { Receiver, Transmitter, decodePayload } from './src/protocol.js';
+import { readCode } from './src/detect.js';
+import { rasterize } from './src/raster.js';
+import { simulateCamera } from './src/synth.js';
+import { crc32, formatBytes, mulberry32 } from './src/util.js';
+import { $, makeLogger, persist } from './src/ui.js';
+
+const log = makeLogger($('#log'));
+const els = {
+  drop: $('#drop'), file: $('#file'), size: $('#size'),
+  palette: $('#palette'), grid: $('#grid'), nsym: $('#nsym'),
+  quality: $('#quality'), dropRate: $('#dropRate'), dropVal: $('#dropVal'),
+  run: $('#run'), halt: $('#halt'),
+};
+persist('loopback', {
+  palette: els.palette, grid: els.grid, nsym: els.nsym,
+  quality: els.quality, dropRate: els.dropRate, size: els.size,
+});
+els.dropVal.textContent = els.dropRate.value;
+els.dropRate.addEventListener('input', () => { els.dropVal.textContent = els.dropRate.value; });
+
+let chosen = null;
+els.drop.addEventListener('click', () => els.file.click());
+els.drop.addEventListener('dragover', (e) => { e.preventDefault(); els.drop.classList.add('over'); });
+els.drop.addEventListener('dragleave', () => els.drop.classList.remove('over'));
+els.drop.addEventListener('drop', async (e) => {
+  e.preventDefault(); els.drop.classList.remove('over');
+  if (e.dataTransfer.files[0]) await pick(e.dataTransfer.files[0]);
+});
+els.file.addEventListener('change', () => { if (els.file.files[0]) pick(els.file.files[0]); });
+async function pick(f) {
+  chosen = { name: f.name, bytes: new Uint8Array(await f.arrayBuffer()) };
+  els.drop.innerHTML = `<strong>${f.name}</strong>${formatBytes(chosen.bytes.length)}`;
+}
+
+const QUALITY = {
+  good:   { perspective: 0.015, blur: 1, noise: 4,  vignette: 0.2,  scale: 0.86 },
+  normal: { perspective: 0.05,  blur: 1, noise: 8,  vignette: 0.4,  scale: 0.8  },
+  bad:    { perspective: 0.10,  blur: 2, noise: 14, vignette: 0.55, scale: 0.72,
+            colorGain: [1.08, 0.97, 0.85], gamma: 1.2 },
+};
+
+// 每格摊到多少摄像头像素，是识别成败的第一约束——低于 5 就该报警
+const CAM_W = 960, CAM_H = 540;
+function pxPerCell() {
+  const n = +els.grid.value;
+  return (QUALITY[els.quality.value].scale * Math.min(CAM_W, CAM_H)) / (n + 6);
+}
+function showPxPerCell() {
+  const v = pxPerCell();
+  const cls = v >= 6 ? 'ok' : v >= 4.8 ? 'warn' : 'err';
+  const tip = v >= 6 ? '充裕' : v >= 4.8 ? '偏紧' : '不够，几乎必然读不出';
+  $('#pxCell').innerHTML = `<span class="badge ${cls}">${v.toFixed(1)} px/格 · ${tip}</span>`;
+}
+for (const el of [els.grid, els.quality]) el.addEventListener('change', showPxPerCell);
+showPxPerCell();
+
+const cvSend = $('#cvSend');
+const cvCam = $('#cvCam');
+const ctxSend = cvSend.getContext('2d');
+const ctxCam = cvCam.getContext('2d');
+let halted = false;
+
+function showRaster(ctx, canvas, raster, maxW) {
+  const off = new ImageData(raster.data, raster.width, raster.height);
+  const tmp = document.createElement('canvas');
+  tmp.width = raster.width; tmp.height = raster.height;
+  tmp.getContext('2d').putImageData(off, 0, 0);
+  const scale = Math.min(1, maxW / raster.width);
+  canvas.width = Math.round(raster.width * scale);
+  canvas.height = Math.round(raster.height * scale);
+  ctx.imageSmoothingEnabled = raster.width > canvas.width;
+  ctx.drawImage(tmp, 0, 0, canvas.width, canvas.height);
+}
+
+els.halt.addEventListener('click', () => { halted = true; });
+
+els.run.addEventListener('click', async () => {
+  els.run.disabled = true;
+  els.halt.disabled = false;
+  halted = false;
+  $('#verify').textContent = '—';
+
+  const n = +els.grid.value;
+  const palette = els.palette.value;
+  const nsym = +els.nsym.value;
+  const dropRate = +els.dropRate.value / 100;
+  const camOpts = QUALITY[els.quality.value];
+
+  let name, bytes;
+  if (chosen) {
+    ({ name, bytes } = chosen);
+  } else {
+    const kb = Math.max(1, Math.min(2048, +els.size.value || 32));
+    const rand = mulberry32(20260810);
+    bytes = new Uint8Array(kb * 1024);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = (rand() * 256) | 0;
+    name = `random-${kb}KB.bin`;
+  }
+
+  let tx;
+  try {
+    tx = new Transmitter(bytes, name, { gridSize: n, palette, nsym });
+  } catch (err) {
+    log(`参数不可用：${err.message}`, 'err');
+    els.run.disabled = false; els.halt.disabled = true;
+    return;
+  }
+  const rx = new Receiver();
+  log(`开始：${name} ${formatBytes(bytes.length)} → K=${tx.K} 块 × ${tx.blockSize}B，${palette} / ${n}×${n} / nsym=${nsym}`);
+  $('#kBlocks').textContent = `K = ${tx.K} 块（每块 ${tx.blockSize} B）`;
+
+  const rand = mulberry32(7);
+  let seed = 0, sentFrames = 0, decoded = 0, attempts = 0, msSum = 0;
+  const t0 = performance.now();
+  const maxFrames = tx.K * 8 + 200;
+
+  while (!rx.done && sentFrames < maxFrames && !halted) {
+    // 一次跑一小批，跑完让出主线程好刷新界面
+    const batchEnd = Math.min(sentFrames + 4, maxFrames);
+    while (sentFrames < batchEnd && !rx.done) {
+      const rgb = tx.frame(seed++);
+      sentFrames++;
+      const raster = rasterize(rgb, n, 6, 3);
+      if (sentFrames % 4 === 1) showRaster(ctxSend, cvSend, raster, 300);
+
+      if (rand() < dropRate) continue; // 摄像头没拍到这一帧
+
+      const cam = simulateCamera(raster, { outW: CAM_W, outH: CAM_H, seed: (seed * 7919) >>> 0, ...camOpts });
+      if (sentFrames % 4 === 1) showRaster(ctxCam, cvCam, cam, 460);
+
+      attempts++;
+      const tA = performance.now();
+      const res = readCode(cam.data, cam.width, cam.height, { gridHint: n });
+      msSum += performance.now() - tA;
+      if (!res.ok) continue;
+      const p = decodePayload(res.header, res.payload);
+      if (!p.ok) continue;
+      decoded++;
+      rx.push(res.header, p.block);
+    }
+
+    const prog = rx.progress;
+    $('#progBar').style.width = `${(prog * 100).toFixed(1)}%`;
+    $('#state').innerHTML = `<span class="badge warn">进行中 ${(prog * 100).toFixed(1)}%</span>`;
+    $('#counts').textContent = `${sentFrames} 发 / ${decoded} 识别`;
+    $('#hit').textContent = attempts ? `${((decoded / attempts) * 100).toFixed(0)}%` : '—';
+    $('#ms').textContent = attempts ? `${(msSum / attempts).toFixed(0)} ms` : '—';
+    await new Promise((r) => setTimeout(r, 0));
+  }
+
+  const secs = (performance.now() - t0) / 1000;
+  if (halted) {
+    log('已中止');
+    $('#state').innerHTML = '<span class="badge">已中止</span>';
+  } else if (rx.done) {
+    const same = rx.result.body.length === bytes.length && crc32(rx.result.body) === crc32(bytes);
+    $('#state').innerHTML = same
+      ? '<span class="badge ok">通过</span>'
+      : '<span class="badge err">内容不一致</span>';
+    $('#verify').innerHTML = same
+      ? `文件名「${rx.result.name}」，${formatBytes(rx.result.body.length)}，CRC32 一致 ✓`
+      : '<span style="color:var(--err)">CRC32 不一致</span>';
+    $('#overhead').textContent = `${(decoded / tx.K).toFixed(2)}×`;
+    log(`完成：发 ${sentFrames} 帧，识别 ${decoded} 帧，耗时 ${secs.toFixed(1)}s，喷泉码开销 ${(decoded / tx.K).toFixed(2)}×`, same ? 'ok' : 'err');
+  } else {
+    $('#state').innerHTML = '<span class="badge err">未能收全</span>';
+    const px = pxPerCell();
+    const advice = px < 4.8
+      ? `每格只摊到 ${px.toFixed(1)} 个像素，低于识别下限——请先把版面调小（这是根本原因，加纠错没用）。`
+      : '把纠错调高、版面调小，或换更稳的调色板。';
+    log(`发了 ${sentFrames} 帧仍未收全（识别成功率 ${((decoded / Math.max(attempts, 1)) * 100).toFixed(0)}%）。${advice}`, 'err');
+  }
+  els.run.disabled = false;
+  els.halt.disabled = true;
+});
+</script>
+</body>
+</html>

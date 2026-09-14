@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>发送端 · 闪烁码传输</title>
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1>发送端</h1>
+    <span class="sub">把文件喷成一串闪烁码，循环播放</span>
+    <nav>
+      <a href="index.html">首页</a>
+      <a href="send.html" aria-current="page">发送</a>
+      <a href="recv.html">接收</a>
+      <a href="loopback.html">自检</a>
+    </nav>
+  </header>
+
+  <div class="cols">
+    <div>
+      <div class="panel">
+        <h2>要发什么</h2>
+        <div class="drop" id="drop">
+          <strong>拖文件到这里</strong>
+          或点击选择
+        </div>
+        <input type="file" id="file" hidden>
+        <label class="field" style="margin-top:12px">
+          <span>或者直接发一段文字</span>
+          <textarea id="text" placeholder="留空则使用上面选择的文件"></textarea>
+        </label>
+        <div class="row">
+          <button id="start" class="primary" disabled>开始发送</button>
+          <button id="stop" disabled>停止</button>
+          <button id="full" disabled>全屏</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>参数</h2>
+        <label class="field">
+          <span>调色板 <span class="hint">决定每格能装几位</span></span>
+          <select id="palette">
+            <option value="bw">黑白 · 1 bit/格 · 最稳</option>
+            <option value="gray4">四灰阶 · 2 bit/格</option>
+            <option value="rgb8" selected>八色 · 3 bit/格 · 最快</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>版面尺寸 <span class="hint">格数越多越快，但要求摄像头分辨率更高</span></span>
+          <select id="grid">
+            <option value="41">41 × 41</option>
+            <option value="49">49 × 49</option>
+            <option value="57">57 × 57</option>
+            <option value="65" selected>65 × 65</option>
+            <option value="73">73 × 73</option>
+            <option value="81">81 × 81</option>
+            <option value="97">97 × 97</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>纠错强度 <span class="hint">条件差就调高</span></span>
+          <select id="nsym">
+            <option value="16">低（约 6% 冗余）</option>
+            <option value="32" selected>中（约 13% 冗余）</option>
+            <option value="48">高（约 19% 冗余）</option>
+            <option value="64">很高（约 25% 冗余）</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>帧率 <b id="fpsVal">10</b> fps <span class="hint">超过摄像头能拍下的速度只会白丢帧</span></span>
+          <input type="range" id="fps" min="2" max="30" step="1" value="10">
+        </label>
+      </div>
+
+      <div class="panel">
+        <h2>状态</h2>
+        <table class="kv">
+          <tr><td>内容</td><td id="sName">—</td></tr>
+          <tr><td>大小</td><td id="sSize">—</td></tr>
+          <tr><td>分块</td><td id="sBlocks">—</td></tr>
+          <tr><td>每帧净载荷</td><td id="sPayload">—</td></tr>
+          <tr><td>理论速率</td><td id="sRate">—</td></tr>
+          <tr><td>跑完一轮</td><td id="sRound">—</td></tr>
+          <tr><td>已发帧数</td><td id="sSent">0</td></tr>
+          <tr><td>实际帧率</td><td id="sFps">—</td></tr>
+        </table>
+        <p class="note" style="margin-bottom:0">
+          发送端会一直循环喷射随机组合帧（喷泉码），接收端收够约 1.3 倍的块数就能还原，
+          不需要你等它「发完一遍」。
+        </p>
+      </div>
+    </div>
+
+    <div>
+      <div class="stage" id="stage">
+        <span class="placeholder" id="ph">选好文件后点「开始发送」</span>
+        <canvas id="cv" hidden></canvas>
+      </div>
+      <p class="note" style="margin-top:12px">
+        <b>拍摄建议：</b>把手机摄像头对准整块码图，让它尽量占满取景框；保持 20~40cm、镜头与屏幕大致平行；
+        屏幕亮度调高、避免反光。识别不稳时优先：<b>降帧率</b> → <b>减小版面</b> → <b>提高纠错</b> → 换黑白调色板。
+      </p>
+      <p class="note">
+        <b>注意：</b>切到别的标签页或锁屏后浏览器会暂停动画，播放随之停止——发送期间让这个页面保持在前台（建议点全屏）。
+      </p>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import { Transmitter, frameGeometry } from './src/protocol.js';
+import { formatBytes, formatDuration, utf8Encode } from './src/util.js';
+import { $, fitCanvas, makeFramePainter, persist } from './src/ui.js';
+
+const els = {
+  drop: $('#drop'), file: $('#file'), text: $('#text'),
+  start: $('#start'), stop: $('#stop'), full: $('#full'),
+  palette: $('#palette'), grid: $('#grid'), nsym: $('#nsym'), fps: $('#fps'), fpsVal: $('#fpsVal'),
+  stage: $('#stage'), cv: $('#cv'), ph: $('#ph'),
+};
+
+persist('send', {
+  palette: els.palette, grid: els.grid, nsym: els.nsym, fps: els.fps,
+});
+els.fpsVal.textContent = els.fps.value;
+
+let payload = null;      // {name, bytes}
+let tx = null;
+let painter = null;
+let running = false;
+let seed = 0;
+let sent = 0;
+let rafId = 0;
+let lastFrameAt = 0;
+let fpsWindow = [];
+
+/* ---------------- 选择内容 ---------------- */
+
+function setPayload(name, bytes) {
+  payload = { name, bytes };
+  $('#sName').textContent = name;
+  $('#sSize').textContent = formatBytes(bytes.length);
+  els.start.disabled = false;
+  previewParams();
+}
+
+els.drop.addEventListener('click', () => els.file.click());
+els.drop.addEventListener('dragover', (e) => { e.preventDefault(); els.drop.classList.add('over'); });
+els.drop.addEventListener('dragleave', () => els.drop.classList.remove('over'));
+els.drop.addEventListener('drop', async (e) => {
+  e.preventDefault();
+  els.drop.classList.remove('over');
+  const f = e.dataTransfer.files[0];
+  if (f) loadFile(f);
+});
+els.file.addEventListener('change', () => { if (els.file.files[0]) loadFile(els.file.files[0]); });
+
+async function loadFile(f) {
+  const buf = new Uint8Array(await f.arrayBuffer());
+  els.text.value = '';
+  els.drop.innerHTML = `<strong>${f.name}</strong>${formatBytes(buf.length)}`;
+  setPayload(f.name, buf);
+}
+
+els.text.addEventListener('input', () => {
+  const t = els.text.value;
+  if (!t) {
+    if (!els.file.files[0]) { payload = null; els.start.disabled = true; }
+    return;
+  }
+  setPayload('message.txt', utf8Encode(t));
+});
+
+/* ---------------- 参数预览 ---------------- */
+
+function currentOpts() {
+  return {
+    gridSize: +els.grid.value,
+    palette: els.palette.value,
+    nsym: +els.nsym.value,
+  };
+}
+
+function previewParams() {
+  const o = currentOpts();
+  let geo;
+  try {
+    geo = frameGeometry(o.gridSize, o.palette, o.nsym);
+  } catch (err) {
+    $('#sPayload').textContent = '参数不可用';
+    return;
+  }
+  const fps = +els.fps.value;
+  $('#sPayload').textContent = `${geo.blockSize} B`;
+  $('#sRate').textContent = `${((geo.blockSize * fps) / 1024).toFixed(1)} KB/s`;
+  if (payload) {
+    // 数据流会多出文件头（魔数 + 长度 + CRC + 文件名）
+    const streamLen = payload.bytes.length + 16 + utf8Encode(payload.name).length;
+    const K = Math.ceil(streamLen / geo.blockSize);
+    $('#sBlocks').textContent = `K = ${K} 块`;
+    $('#sRound').textContent = `${formatDuration(K / fps)}（不含喷泉码开销）`;
+  }
+}
+
+for (const el of [els.palette, els.grid, els.nsym]) el.addEventListener('change', previewParams);
+els.fps.addEventListener('input', () => { els.fpsVal.textContent = els.fps.value; previewParams(); });
+
+/* ---------------- 播放 ---------------- */
+
+function layout() {
+  const n = tx.gridSize;
+  // 只能用容器宽度和视口高度来算：stage 的高度取决于画布，画布再取决于 stage 就锁死了
+  const box = els.stage.getBoundingClientRect();
+  const vertical = document.fullscreenElement ? window.innerHeight - 24 : window.innerHeight - 150;
+  const avail = Math.max(200, Math.min(box.width - 28, vertical));
+  fitCanvas(els.cv, n, avail);
+  painter = makeFramePainter(els.cv, n);
+}
+
+function start() {
+  if (!payload) return;
+  const o = currentOpts();
+  try {
+    tx = new Transmitter(payload.bytes, payload.name, o);
+  } catch (err) {
+    alert(`参数不可用：${err.message}`);
+    return;
+  }
+  seed = 0; sent = 0; fpsWindow = [];
+  els.ph.hidden = true;
+  els.cv.hidden = false;
+  layout();
+  $('#sBlocks').textContent = `K = ${tx.K} 块（每块 ${tx.blockSize} B）`;
+  els.start.disabled = true;
+  els.stop.disabled = false;
+  els.full.disabled = false;
+  for (const el of [els.palette, els.grid, els.nsym]) el.disabled = true;
+  running = true;
+  lastFrameAt = 0;
+  rafId = requestAnimationFrame(tick);
+}
+
+function stop() {
+  running = false;
+  cancelAnimationFrame(rafId);
+  els.start.disabled = !payload;
+  els.stop.disabled = true;
+  for (const el of [els.palette, els.grid, els.nsym]) el.disabled = false;
+}
+
+function tick(now) {
+  if (!running) return;
+  rafId = requestAnimationFrame(tick);
+  const interval = 1000 / +els.fps.value;
+  if (now - lastFrameAt < interval - 1) return;
+  lastFrameAt = now;
+
+  painter(tx.frame(seed));
+  seed = (seed + 1) >>> 0;
+  sent++;
+
+  fpsWindow.push(now);
+  while (fpsWindow.length > 1 && now - fpsWindow[0] > 2000) fpsWindow.shift();
+  if (sent % 5 === 0) {
+    $('#sSent').textContent = `${sent}（第 ${Math.floor(sent / tx.K) + 1} 轮）`;
+    if (fpsWindow.length > 3) {
+      const dt = (fpsWindow[fpsWindow.length - 1] - fpsWindow[0]) / (fpsWindow.length - 1);
+      $('#sFps').textContent = `${(1000 / dt).toFixed(1)} fps`;
+    }
+  }
+}
+
+els.start.addEventListener('click', start);
+els.stop.addEventListener('click', stop);
+els.full.addEventListener('click', () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else els.stage.requestFullscreen?.();
+});
+document.addEventListener('fullscreenchange', () => { if (tx) layout(); });
+window.addEventListener('resize', () => { if (tx) layout(); });
+
+previewParams();
+</script>
+</body>
+</html>

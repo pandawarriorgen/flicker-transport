@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>接收端 · 闪烁码传输</title>
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1>接收端</h1>
+    <span class="sub">对准闪烁码，攒够块就能还原文件</span>
+    <nav>
+      <a href="index.html">首页</a>
+      <a href="send.html">发送</a>
+      <a href="recv.html" aria-current="page">接收</a>
+      <a href="loopback.html">自检</a>
+    </nav>
+  </header>
+
+  <div id="insecure" class="panel" hidden style="border-color:#6b5211">
+    <h2 style="color:var(--warn)">摄像头不可用</h2>
+    <p class="note" id="insecureMsg"></p>
+  </div>
+
+  <div class="cols">
+    <div>
+      <div class="panel">
+        <h2>视频源</h2>
+        <label class="field">
+          <span>摄像头</span>
+          <select id="camera"><option value="">（点开始后自动选择）</option></select>
+        </label>
+        <label class="field">
+          <span>识别分辨率 <span class="hint">越高越准，但更吃 CPU</span></span>
+          <select id="workRes">
+            <option value="640">640 宽 · 省电</option>
+            <option value="960" selected>960 宽 · 均衡</option>
+            <option value="1280">1280 宽 · 高精度</option>
+          </select>
+        </label>
+        <div class="row">
+          <button id="start" class="primary">打开摄像头</button>
+          <button id="screen">用屏幕共享测试</button>
+          <button id="stopBtn" disabled>停止</button>
+        </div>
+        <p class="note" style="margin-bottom:0">
+          单机想试一下？点「用屏幕共享测试」，然后选择正在放码图的那个<b>窗口或标签页</b>。
+        </p>
+      </div>
+
+      <div class="panel">
+        <h2>接收进度</h2>
+        <div class="bar"><i id="progBar"></i></div>
+        <table class="kv">
+          <tr><td>状态</td><td id="rState"><span class="badge">等待中</span></td></tr>
+          <tr><td>每格像素</td><td id="rPx">—</td></tr>
+          <tr><td>文件</td><td id="rFile">—</td></tr>
+          <tr><td>已解出</td><td id="rSolved">—</td></tr>
+          <tr><td>有效帧 / 重复</td><td id="rFrames">0 / 0</td></tr>
+          <tr><td>识别率</td><td id="rHit">—</td></tr>
+          <tr><td>解码耗时</td><td id="rMs">—</td></tr>
+          <tr><td>实测速率</td><td id="rRate">—</td></tr>
+          <tr><td>剩余时间</td><td id="rEta">—</td></tr>
+        </table>
+        <div class="row" style="margin-top:10px">
+          <button id="save" class="primary" disabled>保存文件</button>
+          <button id="reset">清空重来</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>日志</h2>
+        <div class="log" id="log"></div>
+      </div>
+    </div>
+
+    <div>
+      <div class="camwrap">
+        <video id="video" playsinline muted></video>
+        <canvas id="overlay" class="overlay"></canvas>
+      </div>
+      <p class="note" style="margin-top:12px">
+        绿框表示已锁定码图。<b>没框</b> = 没找到四角定位图案（拉近点、别太斜、对好焦）；
+        <b>红框</b> = 找到了但读不出内容（说明太糊/太小/太快，降帧率或提高纠错强度）。
+      </p>
+      <div id="preview" class="panel" hidden>
+        <h2>内容预览</h2>
+        <pre id="previewBody" style="white-space:pre-wrap;word-break:break-all;max-height:260px;overflow:auto;margin:0;font-size:12px"></pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import { Receiver } from './src/protocol.js';
+import { formatBytes, formatDuration, utf8Decode } from './src/util.js';
+import { $, downloadBytes, makeLogger, persist } from './src/ui.js';
+
+const els = {
+  video: $('#video'), overlay: $('#overlay'),
+  camera: $('#camera'), workRes: $('#workRes'),
+  start: $('#start'), screen: $('#screen'), stopBtn: $('#stopBtn'),
+  save: $('#save'), reset: $('#reset'),
+};
+const log = makeLogger($('#log'));
+persist('recv', { camera: els.camera, workRes: els.workRes });
+
+const rx = new Receiver();
+let stream = null;
+let running = false;
+let worker = null;
+let workerReady = false;
+let inFlight = false;
+let seq = 0;
+let gridHint = 0;
+let lastQuad = null;
+let lastQuadOk = false;
+let stats = { attempts: 0, decoded: 0, ms: 0, msCount: 0, startedAt: 0 };
+
+const work = document.createElement('canvas');
+const workCtx = work.getContext('2d', { willReadFrequently: true });
+const octx = els.overlay.getContext('2d');
+
+/* ---------------- 安全上下文检查 ---------------- */
+
+if (!navigator.mediaDevices?.getUserMedia) {
+  $('#insecure').hidden = false;
+  $('#insecureMsg').innerHTML = window.isSecureContext
+    ? '这个浏览器没有提供摄像头接口。请换用 Chrome / Edge / Safari 的较新版本。'
+    : `浏览器只在<b>安全上下文</b>下开放摄像头。当前地址是 <code>${location.origin}</code>。
+       请用 <code>http://localhost:8000</code> 打开；如果要在手机上访问电脑，
+       需要 HTTPS —— 运行 <code>node server.js --https</code> 后用 <code>https://电脑IP:8443</code> 访问。`;
+  els.start.disabled = true;
+  els.screen.disabled = true;
+}
+
+/* ---------------- Worker（带主线程兜底） ---------------- */
+
+async function initWorker() {
+  try {
+    const w = new Worker(new URL('./src/decode-worker.js', import.meta.url), { type: 'module' });
+    const ok = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 2000);
+      w.onmessage = (e) => {
+        if (e.data?.type === 'pong') { clearTimeout(timer); resolve(true); }
+      };
+      w.onerror = () => { clearTimeout(timer); resolve(false); };
+      w.postMessage({ type: 'ping' });
+    });
+    if (!ok) { w.terminate(); return null; }
+    return w;
+  } catch {
+    return null;
+  }
+}
+
+let decodeInline = null;
+async function ensureDecoder() {
+  if (worker || decodeInline) return;
+  worker = await initWorker();
+  if (worker) {
+    workerReady = true;
+    worker.onmessage = (e) => { if (e.data?.type === 'result') handleResult(e.data); };
+    log('解码 Worker 已就绪', 'ok');
+  } else {
+    const mod = await import('./src/decode-worker.js');
+    decodeInline = mod.decodeImage;
+    log('当前浏览器不支持 module worker，改在主线程解码（画面可能略卡）');
+  }
+}
+
+/* ---------------- 视频源 ---------------- */
+
+async function listCameras() {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cams = devices.filter((d) => d.kind === 'videoinput');
+    if (!cams.length) return;
+    const cur = els.camera.value;
+    els.camera.innerHTML = '';
+    for (const c of cams) {
+      const o = document.createElement('option');
+      o.value = c.deviceId;
+      o.textContent = c.label || `摄像头 ${els.camera.length + 1}`;
+      els.camera.appendChild(o);
+    }
+    if (cur && cams.some((c) => c.deviceId === cur)) els.camera.value = cur;
+  } catch { /* 忽略 */ }
+}
+
+async function startCamera() {
+  const deviceId = els.camera.value;
+  const constraints = {
+    video: deviceId
+      ? { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+      : { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+    audio: false,
+  };
+  await attach(await navigator.mediaDevices.getUserMedia(constraints));
+  await listCameras();
+  // 尽量让摄像头持续自动对焦 / 自动曝光，屏幕拍摄最怕跑焦
+  const track = stream.getVideoTracks()[0];
+  try {
+    await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }, { exposureMode: 'continuous' }] });
+  } catch { /* 不支持就算了 */ }
+  const s = track.getSettings();
+  log(`摄像头已开：${s.width}×${s.height}${s.frameRate ? ` @${Math.round(s.frameRate)}fps` : ''}`, 'ok');
+}
+
+async function startScreen() {
+  await attach(await navigator.mediaDevices.getDisplayMedia({
+    video: { frameRate: { ideal: 30 } }, audio: false,
+  }));
+  log('屏幕共享已开始', 'ok');
+}
+
+async function attach(newStream) {
+  stopStream();
+  stream = newStream;
+  els.video.srcObject = stream;
+  await els.video.play();
+  stream.getVideoTracks()[0].addEventListener('ended', () => stopAll());
+  await ensureDecoder();
+  running = true;
+  els.stopBtn.disabled = false;
+  els.start.disabled = true;
+  els.screen.disabled = true;
+  stats.startedAt = performance.now();
+  loop();
+}
+
+function stopStream() {
+  if (stream) { for (const t of stream.getTracks()) t.stop(); stream = null; }
+}
+
+function stopAll() {
+  running = false;
+  stopStream();
+  els.stopBtn.disabled = true;
+  els.start.disabled = false;
+  els.screen.disabled = false;
+  octx.clearRect(0, 0, els.overlay.width, els.overlay.height);
+  log('已停止');
+}
+
+/* ---------------- 主循环 ---------------- */
+
+function loop() {
+  if (!running) return;
+  const useRvfc = typeof els.video.requestVideoFrameCallback === 'function';
+  const next = () => (useRvfc ? els.video.requestVideoFrameCallback(loop) : requestAnimationFrame(loop));
+
+  const vw = els.video.videoWidth;
+  const vh = els.video.videoHeight;
+  if (!vw || !vh) { next(); return; }
+
+  if (els.overlay.width !== vw || els.overlay.height !== vh) {
+    els.overlay.width = vw;
+    els.overlay.height = vh;
+  }
+  drawOverlay();
+
+  if (!inFlight && !rx.done) {
+    const targetW = Math.min(+els.workRes.value, vw);
+    const targetH = Math.round((targetW * vh) / vw);
+    if (work.width !== targetW || work.height !== targetH) {
+      work.width = targetW;
+      work.height = targetH;
+    }
+    workCtx.drawImage(els.video, 0, 0, targetW, targetH);
+    const img = workCtx.getImageData(0, 0, targetW, targetH);
+    stats.attempts++;
+    inFlight = true;
+    if (worker && workerReady) {
+      worker.postMessage(
+        { type: 'frame', seq: ++seq, data: img.data, width: targetW, height: targetH, gridHint },
+        [img.data.buffer]
+      );
+    } else if (decodeInline) {
+      const out = decodeInline(img.data, targetW, targetH, gridHint);
+      handleResult(out);
+    } else {
+      inFlight = false;
+    }
+  }
+  next();
+}
+
+function handleResult(res) {
+  inFlight = false;
+  stats.ms += res.ms || 0;
+  stats.msCount++;
+  lastQuad = res.quad || null;
+  lastQuadOk = !!res.ok;
+
+  // 定位图案检测顺带量出了模块尺寸，也就是「一格摊到几个像素」。
+  // 这是识别成败的第一约束：低于 5 就该拉近或减小版面，加纠错没用。
+  if (lastQuad) {
+    const px = lastQuad.reduce((s, p) => s + p.size, 0) / 4;
+    const cls = px >= 6 ? 'ok' : px >= 4.8 ? 'warn' : 'err';
+    const tip = px >= 6 ? '充裕' : px >= 4.8 ? '偏紧，可拉近些' : '不够，请拉近或减小版面';
+    $('#rPx').innerHTML = `<span class="badge ${cls}">${px.toFixed(1)} px/格 · ${tip}</span>`;
+  }
+
+  if (!res.ok) { refreshStats(); return; }
+
+  stats.decoded++;
+  gridHint = res.gridSize;
+  const before = rx.progress;
+  const status = rx.push(res.header, res.block);
+  if (status === 'restart') {
+    log(`发现新的传输任务（fileId=${res.header.fileId}，K=${res.header.K}，每块 ${res.header.blockSize}B）`, 'ok');
+    stats.startedAt = performance.now();
+    els.save.disabled = true;
+    $('#preview').hidden = true;
+  }
+  if (rx.done) finish();
+  refreshStats(before);
+}
+
+function finish() {
+  const { name, body } = rx.result;
+  els.save.disabled = false;
+  log(`接收完成：${name}（${formatBytes(body.length)}），CRC32 校验通过`, 'ok');
+  $('#rState').innerHTML = '<span class="badge ok">已完成</span>';
+  // 文本类内容直接预览一下
+  if (body.length < 200000) {
+    try {
+      const text = utf8Decode(body);
+      // 前几千字符里没有控制字符，就当成文本预览
+      let printable = text.length > 0;
+      for (let k = 0; k < Math.min(text.length, 4000); k++) {
+        const c = text.charCodeAt(k);
+        if (c < 32 && c !== 9 && c !== 10 && c !== 13) { printable = false; break; }
+      }
+      if (printable) {
+        $('#preview').hidden = false;
+        $('#previewBody').textContent = text.slice(0, 8000);
+      }
+    } catch { /* 二进制内容，不预览 */ }
+  }
+}
+
+function refreshStats(prevProgress = null) {
+  const p = rx.progress;
+  $('#progBar').style.width = `${(p * 100).toFixed(1)}%`;
+  if (!rx.done) {
+    $('#rState').innerHTML = rx.active
+      ? `<span class="badge warn">接收中 ${(p * 100).toFixed(1)}%</span>`
+      : '<span class="badge">等待中</span>';
+  }
+  if (rx.active) {
+    $('#rSolved').textContent = `${rx.lt.solvedCount} / ${rx.K} 块`;
+    $('#rFrames').textContent = `${rx.framesAccepted} / ${rx.framesDuplicate + rx.framesRedundant}`;
+    const elapsed = (performance.now() - stats.startedAt) / 1000;
+    const bytes = rx.lt.solvedCount * rx.blockSize;
+    if (elapsed > 1) {
+      $('#rRate').textContent = `${(bytes / 1024 / elapsed).toFixed(1)} KB/s`;
+      const rate = p / elapsed;
+      $('#rEta').textContent = rx.done ? '—' : formatDuration((1 - p) / Math.max(rate, 1e-6));
+    }
+  }
+  if (stats.attempts) {
+    $('#rHit').textContent = `${((stats.decoded / stats.attempts) * 100).toFixed(0)}%（${stats.decoded}/${stats.attempts}）`;
+  }
+  if (stats.msCount) $('#rMs').textContent = `${(stats.ms / stats.msCount).toFixed(0)} ms/帧`;
+  if (rx.result) $('#rFile').textContent = `${rx.result.name}（${formatBytes(rx.result.body.length)}）`;
+}
+
+function drawOverlay() {
+  const w = els.overlay.width;
+  const h = els.overlay.height;
+  octx.clearRect(0, 0, w, h);
+  if (!lastQuad) return;
+  // quad 是识别分辨率下的坐标，按比例放大回视频原尺寸
+  const k = w / work.width;
+  octx.lineWidth = Math.max(2, w / 320);
+  octx.strokeStyle = lastQuadOk ? '#3fb950' : '#f85149';
+  octx.beginPath();
+  lastQuad.forEach((p, i) => {
+    const x = p.x * k;
+    const y = p.y * k;
+    if (i === 0) octx.moveTo(x, y); else octx.lineTo(x, y);
+  });
+  octx.closePath();
+  octx.stroke();
+}
+
+/* ---------------- 按钮 ---------------- */
+
+els.start.addEventListener('click', () => startCamera().catch((e) => log(`打开摄像头失败：${e.message}`, 'err')));
+els.screen.addEventListener('click', () => startScreen().catch((e) => log(`屏幕共享失败：${e.message}`, 'err')));
+els.stopBtn.addEventListener('click', stopAll);
+els.camera.addEventListener('change', () => { if (running) startCamera().catch(() => {}); });
+
+els.save.addEventListener('click', () => {
+  if (rx.result) downloadBytes(rx.result.body, rx.result.name);
+});
+els.reset.addEventListener('click', () => {
+  rx.reset();
+  gridHint = 0;
+  stats = { attempts: 0, decoded: 0, ms: 0, msCount: 0, startedAt: performance.now() };
+  els.save.disabled = true;
+  $('#preview').hidden = true;
+  $('#rFile').textContent = '—';
+  $('#rSolved').textContent = '—';
+  $('#rState').innerHTML = '<span class="badge">等待中</span>';
+  refreshStats();
+  log('已清空');
+});
+
+if (navigator.mediaDevices?.enumerateDevices) listCameras();
+setInterval(() => { if (running) refreshStats(); }, 500);
+</script>
+</body>
+</html>

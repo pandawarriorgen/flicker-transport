@@ -1,0 +1,12 @@
+{
+  "name": "flicker-transport",
+  "version": "1.0.0",
+  "description": "用闪烁的二维码状图像在屏幕与摄像头之间传输文件（喷泉码 + RS 纠错，纯前端零依赖）",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node test/selftest.js",
+    "bench": "node test/selftest.js --bench",
+    "serve": "node server.js"
+  }
+}
